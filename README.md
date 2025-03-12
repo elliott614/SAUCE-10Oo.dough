@@ -36,6 +36,7 @@ The app uses a high-performance bitset (bitmap) implementation to track which no
 
 ## Installing the Project
 
+- x64 Windows Executable Provided, No Install Necessary
 - Currently only Windows standalone installer is implemented
 - In `/SAUCE10oOdough/installer` directory.
 
