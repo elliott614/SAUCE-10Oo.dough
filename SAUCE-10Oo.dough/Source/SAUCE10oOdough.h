@@ -1,20 +1,46 @@
-/*
-  ==============================================================================
+﻿// Count newlines - MSVC-compatible version without GCC/Clang intrinsics
+static int countNewlines(const juce::String& str)
+{
+    int count = 0;
+    const char* data = str.toRawUTF8();
+    const int length = str.length();
 
-   This file is part of the JUCE tutorials.
-   Copyright (c) 2020 - Raw Material Software Limited
+    // Process 4 bytes at a time for better cache usage and instruction parallelism
+    const int vectorEnd = length - (length % 4);
 
-   The code included in this file is provided under the terms of the ISC license
-   http://www.isc.org/downloads/software-support-policy/isc-license. Permission
-   To use, copy, modify, and/or distribute this software for any purpose with or
-   without fee is hereby granted provided that the above copyright notice and
-   this permission notice appear in all copies.
+    for (int i = 0; i < vectorEnd; i += 4)
+    {
+        // Process 4 bytes in parallel with fewer branches
+        count += (data[i] == '\n');
+        count += (data[i + 1] == '\n');
+        count += (data[i + 2] == '\n');
+        count += (data[i + 3] == '\n');
+    }
 
-   THE SOFTWARE IS PROVIDED "AS IS" WITHOUT ANY WARRANTY, AND ALL WARRANTIES,
-   WHETHER EXPRESSED OR IMPLIED, INCLUDING MERCHANTABILITY AND FITNESS FOR
-   PURPOSE, ARE DISCLAIMED.
+    // Process remaining bytes
+    for (int i = vectorEnd; i < length; ++i)
+    {
+        count += (data[i] == '\n');
+    }
 
-  ==============================================================================
+    return count;
+}/*
+==============================================================================
+
+ This file is part of the JUCE tutorials.
+ Copyright (c) 2020 - Raw Material Software Limited
+
+ The code included in this file is provided under the terms of the ISC license
+ http://www.isc.org/downloads/software-support-policy/isc-license. Permission
+ To use, copy, modify, and/or distribute this software for any purpose with or
+ without fee is hereby granted provided that the above copyright notice and
+ this permission notice appear in all copies.
+
+ THE SOFTWARE IS PROVIDED "AS IS" WITHOUT ANY WARRANTY, AND ALL WARRANTIES,
+ WHETHER EXPRESSED OR IMPLIED, INCLUDING MERCHANTABILITY AND FITNESS FOR
+ PURPOSE, ARE DISCLAIMED.
+
+==============================================================================
 */
 
 /*******************************************************************************
@@ -48,37 +74,84 @@
 #pragma once
 #include <JuceHeader.h>
 #include "PedalButton.h"
-#include <bitset>
+
 //==============================================================================
 class MainContentComponent : public juce::Component,
     private juce::MidiInputCallback,
-    private juce::MidiKeyboardStateListener
+    private juce::MidiKeyboardStateListener,
+    private juce::AsyncUpdater
 {
 public:
+    // Simple structure to hold log entries
+    struct LogEntry {
+        juce::MidiMessage message;
+        juce::String source;
+        double timestamp;
+    };
+
+    // Timer class to handle log updates at a consistent rate
+    class LogTimer : public juce::Timer
+    {
+    public:
+        LogTimer(MainContentComponent* owner) : owner(owner) {}
+        void timerCallback() override { owner->processLogEntries(); }
+    private:
+        MainContentComponent* owner;
+    };
+
+    // Job class for background MIDI processing
+    class MidiProcessingJob : public juce::ThreadPoolJob
+    {
+    public:
+        MidiProcessingJob(MainContentComponent& owner, const juce::MidiMessage& msg)
+            : ThreadPoolJob("MIDI Processing"),
+            parent(owner),
+            message(msg)
+        {
+        }
+
+        JobStatus runJob() override
+        {
+            // Only process non-critical messages here
+            if (!message.isNoteOnOrOff() &&
+                !message.isSostenutoPedalOn() &&
+                !message.isSostenutoPedalOff())
+            {
+                if (parent.midiOutput != nullptr)
+                    parent.midiOutput->sendMessageNow(message);
+            }
+            return JobStatus::jobHasFinished;
+        }
+
+    private:
+        MainContentComponent& parent;
+        juce::MidiMessage message;
+    };
+
     MainContentComponent()
         : keyboardComponent(keyboardState, juce::MidiKeyboardComponent::horizontalKeyboard),
         startTime(juce::Time::getMillisecondCounterHiRes() * 0.001),
         sostenutoPedalButton("\n\nSAUCE\n\n10\n\noO\n\ndough\n\n")
     {
-
         setOpaque(true);
+
+        // Setup MIDI input components
         addAndMakeVisible(midiInputListLabel);
         midiInputListLabel.setText("MIDI Input:", juce::dontSendNotification);
         midiInputListLabel.attachToComponent(&midiInputList, true);
 
         addAndMakeVisible(midiInputList);
         midiInputList.setTextWhenNoChoicesAvailable("No MIDI Inputs Enabled");
+
         auto midiInputs = juce::MidiInput::getAvailableDevices();
-
         juce::StringArray midiInputNames;
-
         for (auto input : midiInputs)
             midiInputNames.add(input.name);
 
         midiInputList.addItemList(midiInputNames, 1);
         midiInputList.onChange = [this] { setMidiInput(midiInputList.getSelectedItemIndex()); };
 
-        // find the first enabled device and use that by default
+        // Find the first enabled device and use that by default
         for (auto input : midiInputs)
         {
             if (deviceManager.isMidiInputDeviceEnabled(input.identifier))
@@ -88,13 +161,15 @@ public:
             }
         }
 
-        // if no enabled devices were found just use the first one in the list
+        // If no enabled devices were found just use the first one in the list
         if (midiInputList.getSelectedId() == 0)
             setMidiInput(0);
 
+        // Setup keyboard component
         addAndMakeVisible(keyboardComponent);
         keyboardState.addListener(this);
 
+        // Setup MIDI message display box
         addAndMakeVisible(midiMessagesBox);
         midiMessagesBox.setMultiLine(true);
         midiMessagesBox.setReturnKeyStartsNewLine(true);
@@ -105,7 +180,15 @@ public:
         midiMessagesBox.setColour(juce::TextEditor::backgroundColourId, juce::Colour(0x32ffffff));
         midiMessagesBox.setColour(juce::TextEditor::outlineColourId, juce::Colour(0x1c000000));
         midiMessagesBox.setColour(juce::TextEditor::shadowColourId, juce::Colour(0x16000000));
+        StringArray fbf;
+        fbf.insert(0, Font::getDefaultMonospacedFontName());
+        Font fo(FontOptions("Consolas", 15, Font::plain));
+        fo.setPreferredFallbackFamilies(fbf);
+        midiMessagesBox.setFont(fo);
 
+        midiMessagesBox.insertTextAtCaret("          ||#|#|||#|#|#|||#|#||\n          ||w|e|||t|y|u|||o|p||\n          |aTsTd|fTgThTj|kTlT;|\n          |_|_|_|_|_|_|_|_|_|_|\nwill play keys on one type of keyboard with the other\n");
+
+        // Setup logging toggle button
         addAndMakeVisible(loggingEnabledButton);
         loggingEnabledButton.setButtonText("Enable MIDI Logging");
         loggingEnabledButton.setToggleState(false, juce::dontSendNotification);
@@ -113,22 +196,22 @@ public:
             loggingEnabled = loggingEnabledButton.getToggleState();
             if (!loggingEnabled)
             {
-                // Clear the log when logging is disabled
                 midiMessagesBox.clear();
                 currentLogLines = 0;
             }
         };
 
+        // Setup sostenuto pedal button
         addAndMakeVisible(sostenutoPedalButton);
         sostenutoPedalButton.onClick = [this] { handleSostenutoPedalButton(); };
 
-        setSize(600, 400);
-
-        // Output setup
+        // Setup MIDI output components
         auto midiOutputs = juce::MidiOutput::getAvailableDevices();
+
         addAndMakeVisible(midiOutputListLabel);
         midiOutputListLabel.setText("MIDI Output:", juce::dontSendNotification);
         midiOutputListLabel.attachToComponent(&midiOutputList, true);
+
         addAndMakeVisible(midiOutputList);
         midiOutputList.setTextWhenNoChoicesAvailable("No MIDI Outputs Available");
 
@@ -141,12 +224,28 @@ public:
 
         // Find and select the first available output device
         setMidiOutput(0);
+
+        // Setup thread pool for background processing
+        configureThreadPool();
+
+        // Setup log timer with configurable refresh rate
+        logTimer = std::make_unique<LogTimer>(this);
+        logTimer->startTimerHz(LOG_TIMER_FREQUENCY);
+
+        setSize(600, 400);
+        keyboardComponent.grabKeyboardFocus();
     }
 
     ~MainContentComponent() override
     {
+        logTimer->stopTimer();
+        midiThreadPool->removeAllJobs(true, 2000);
         keyboardState.removeListener(this);
-        deviceManager.removeMidiInputDeviceCallback(juce::MidiInput::getAvailableDevices()[midiInputList.getSelectedItemIndex()].identifier, this);
+
+        if (lastInputIndex >= 0 && lastInputIndex < juce::MidiInput::getAvailableDevices().size())
+            deviceManager.removeMidiInputDeviceCallback(
+                juce::MidiInput::getAvailableDevices()[lastInputIndex].identifier, this);
+
         if (midiOutput)
             midiOutput->stopBackgroundThread();
     }
@@ -154,6 +253,7 @@ public:
     void paint(juce::Graphics& g) override
     {
         g.fillAll(juce::Colours::black);
+        keyboardComponent.grabKeyboardFocus();
     }
 
     void resized() override
@@ -165,128 +265,363 @@ public:
         const int labelWidth = 100;
         const int comboBoxWidth = (getWidth() - labelWidth * 2) / 2 - 16;
 
-        // Position input list
+        // Position input and output lists
         midiInputList.setBounds(labelWidth, 8, comboBoxWidth, 24);
-
-        // Position output list
         midiOutputList.setBounds(labelWidth + comboBoxWidth + labelWidth, 8, comboBoxWidth, 24);
 
-        // Add checkbox position - next to the pedal
+        // Define sizes for other controls
         const int checkboxWidth = 150;
         const int checkboxHeight = 24;
         const int pedalWidth = 50;
         const int pedalHeight = 100;
         const int pedalMargin = 10;
 
-        // Position the keyboard below the input/output lists
+        // Position the keyboard
         auto keyboardArea = area.removeFromTop(80);
-        keyboardComponent.setBounds(keyboardArea.reduced(8));  // Add this line back
+        keyboardComponent.setBounds(keyboardArea.reduced(8));
 
         // Remove space for the bottom controls
         auto bottomArea = area.removeFromBottom(pedalHeight + pedalMargin);
 
-        // Position the message box in the remaining space
+        // Position the message box
         midiMessagesBox.setBounds(area.reduced(8));
 
-        // Position the pedal button centered horizontally
+        // Position the pedal button and checkbox
         const int pedalX = (getWidth() - pedalWidth - checkboxWidth - 20) / 2;
         const int pedalY = getHeight() - pedalHeight - pedalMargin;
         sostenutoPedalButton.setBounds(pedalX, pedalY, pedalWidth, pedalHeight);
-
-        // Position checkbox next to the pedal
         loggingEnabledButton.setBounds(pedalX + pedalWidth + 20, pedalY + (pedalHeight - checkboxHeight) / 2,
             checkboxWidth, checkboxHeight);
+        sostenutoPedalButton.setMouseClickGrabsKeyboardFocus(false);
+        loggingEnabledButton.setMouseClickGrabsKeyboardFocus(false);
+        midiMessagesBox.setMouseClickGrabsKeyboardFocus(false);
+        keyboardComponent.grabKeyboardFocus();
     }
 
-
-
-private:
-    static juce::String getMidiMessageDescription(const juce::MidiMessage& m)
+    // Process incoming MIDI messages
+    void processMessageOnThread(const juce::MidiMessage& message)
     {
-        if (m.isNoteOn())           return "Note on " + juce::MidiMessage::getMidiNoteName(m.getNoteNumber(), true, true, 3);
-        if (m.isNoteOff())          return "Note off " + juce::MidiMessage::getMidiNoteName(m.getNoteNumber(), true, true, 3);
-        if (m.isProgramChange())    return "Program change " + juce::String(m.getProgramChangeNumber());
-        if (m.isPitchWheel())       return "Pitch wheel " + juce::String(m.getPitchWheelValue());
-        if (m.isAftertouch())       return "After touch " + juce::MidiMessage::getMidiNoteName(m.getNoteNumber(), true, true, 3) + ": " + juce::String(m.getAfterTouchValue());
-        if (m.isChannelPressure())  return "Channel pressure " + juce::String(m.getChannelPressureValue());
-        if (m.isAllNotesOff())      return "All notes off";
-        if (m.isAllSoundOff())      return "All sound off";
-        if (m.isMetaEvent())        return "Meta event";
+        const juce::ScopedLock sl(midiProcessLock);
 
-        if (m.isController())
+        // Handle time-critical messages immediately
+        if (message.isNoteOnOrOff() || (message.isController() && message.getControllerNumber() == 66))
         {
-            juce::String name(juce::MidiMessage::getControllerName(m.getControllerNumber()));
-
-            if (name.isEmpty())
-                name = "[" + juce::String(m.getControllerNumber()) + "]";
-
-            return "Controller " + name + ": " + juce::String(m.getControllerValue());
+            processMidiRealTime(message);
         }
-
-        return juce::String::toHexString(m.getRawData(), m.getRawDataSize());
+        else
+        {
+            // For non-time-critical messages, add to buffer for batch processing
+            midiMessageBuffer.addEvent(message, 0);
+        }
     }
 
-    void logMessage(const juce::String& m)
+    // Process and display log entries
+    void processLogEntries()
     {
         if (!loggingEnabled)
             return;
 
-        // Add new message to end
-        midiMessagesBox.moveCaretToEnd();
-        midiMessagesBox.insertTextAtCaret(m + juce::newLine);
+        const int numReady = logFifo.getNumReady();
+        if (numReady == 0)
+            return;
 
-        // Increment line counter
-        currentLogLines++;
+        // Build text off the message thread
+        juce::String textToAdd;
+        int start1, size1, start2, size2;
+        logFifo.prepareToRead(numReady, start1, size1, start2, size2);
 
-        // Check if we need to trim the log
-        if (currentLogLines > MAX_LOG_LINES)
+        for (int i = 0; i < size1; ++i)
+            textToAdd += formatLogEntry(logEntries[start1 + i]);
+
+        for (int i = 0; i < size2; ++i)
+            textToAdd += formatLogEntry(logEntries[start2 + i]);
+
+        logFifo.finishedRead(size1 + size2);
+
+        // Single update to text editor
+        if (textToAdd.isNotEmpty())
         {
-            // Get current text
-            auto text = midiMessagesBox.getText();
-
-            // Find position of the (currentLogLines - MAX_LOG_LINES + 1)th newline
-            // This approach removes multiple lines at once if needed
-            int linesToRemove = currentLogLines - MAX_LOG_LINES;
-            int currentPos = 0;
-            int newlineCount = 0;
-
-            // Find the position after the last newline we need to remove
-            while (newlineCount < linesToRemove && currentPos < text.length())
+            juce::MessageManager::callAsync([this, text = std::move(textToAdd)]() mutable
             {
-                if (text[currentPos] == '\n')
-                    newlineCount++;
+                midiMessagesBox.moveCaretToEnd();
+                midiMessagesBox.insertTextAtCaret(text);
 
-                currentPos++;
+                // Count newlines using direct access to the string data with getCharPointer()
+                auto charPtr = text.getCharPointer();
+                int newlineCount = 0;
+
+                while (!charPtr.isEmpty())
+                {
+                    if (*charPtr == '\n')
+                        newlineCount++;
+                    ++charPtr;
+                }
+
+                currentLogLines += newlineCount;
+                trimLogIfNeeded();
+            });
+        }
+    }
+
+private:
+    // Optimized for branchless comparison of MIDI message types
+    static juce::String getMidiMessageDescription(const juce::MidiMessage& m)
+    {
+        juce::String result;
+
+        // Pre-check properties to avoid multiple evaluations
+        const bool isNoteOn = m.isNoteOn();
+        const bool isNoteOff = m.isNoteOff();
+        const bool isProgramChange = m.isProgramChange();
+        const bool isPitchWheel = m.isPitchWheel();
+        const bool isAftertouch = m.isAftertouch();
+        const bool isChannelPressure = m.isChannelPressure();
+        const bool isAllNotesOff = m.isAllNotesOff();
+        const bool isAllSoundOff = m.isAllSoundOff();
+        const bool isMetaEvent = m.isMetaEvent();
+        const bool isController = m.isController();
+
+        // Note handling with common shared code
+        if (isNoteOn || isNoteOff)
+        {
+            result = (isNoteOn ? "Note on " : "Note off ") +
+                juce::MidiMessage::getMidiNoteName(m.getNoteNumber(), true, true, 3);
+
+            return result;
+        }
+
+        // Program change
+        if (isProgramChange)
+            return "Program change " + juce::String(m.getProgramChangeNumber());
+
+        // Pitch wheel
+        if (isPitchWheel)
+            return "Pitch wheel " + juce::String(m.getPitchWheelValue());
+
+        // Aftertouch
+        if (isAftertouch)
+            return "After touch " + juce::MidiMessage::getMidiNoteName(m.getNoteNumber(), true, true, 3) + ": " + juce::String(m.getAfterTouchValue());
+
+        // Channel pressure
+        if (isChannelPressure)
+            return "Channel pressure " + juce::String(m.getChannelPressureValue());
+
+        // All notes off
+        if (isAllNotesOff)
+            return "All notes off";
+
+        // All sound off
+        if (isAllSoundOff)
+            return "All sound off";
+
+        // Meta event
+        if (isMetaEvent)
+            return "Meta event";
+
+        // Controller
+        if (isController)
+        {
+            juce::String name(juce::MidiMessage::getControllerName(m.getControllerNumber()));
+
+            // Branchless empty string check using ternary
+            name = name.isEmpty() ? "[" + juce::String(m.getControllerNumber()) + "]" : name;
+
+            return "Controller " + name + ": " + juce::String(m.getControllerValue());
+        }
+
+        // Default - raw MIDI data as hex
+        return juce::String::toHexString(m.getRawData(), m.getRawDataSize());
+    }
+
+    // Configure the thread pool for MIDI processing
+    void configureThreadPool()
+    {
+        int numThreads = std::thread::hardware_concurrency();
+        if (numThreads == 0)
+            numThreads = 2; // Reasonable default
+
+        juce::ThreadPool::Options options;
+        options = options.withThreadName("MIDI Processing")
+            .withNumberOfThreads(numThreads);
+
+        midiThreadPool = std::make_unique<juce::ThreadPool>(options);
+    }
+
+    // Process MIDI messages
+    void processMidiMessage(const juce::MidiMessage& message)
+    {
+        // Handle timing-critical messages first
+        if (message.isNoteOnOrOff() || (message.isController() && message.getControllerNumber() == 66))
+        {
+            processMidiRealTime(message);
+        }
+        else
+        {
+            // Add non-critical messages to processing queue
+            auto* job = new MidiProcessingJob(*this, message);
+            midiThreadPool->addJob(job, true);
+        }
+
+        // Add to log if enabled (separate path)
+        if (loggingEnabled)
+        {
+            const juce::ScopedLock sl(logMutex);
+            int start1, size1, start2, size2;
+            logFifo.prepareToWrite(1, start1, size1, start2, size2);
+
+            if (size1 + size2 > 0)
+            {
+                const int writeIndex = size1 == 1 ? start1 : start2;
+                logEntries[writeIndex] = { message, "MIDI", message.getTimeStamp() };
+                logFifo.finishedWrite(1);
+            }
+        }
+    }
+
+    // Process real-time MIDI messages - MSVC optimized
+    void processMidiRealTime(const juce::MidiMessage& message)
+    {
+        if (message.isNoteOnOrOff())
+        {
+            // Always update keyboard state
+            keyboardState.processNextMidiEvent(message);
+
+            // For note-offs, check if held by sostenuto
+            if (message.isNoteOff())
+            {
+                // Skip sending if held by sostenuto
+                if (isSostenutoPedalHeldNote(message.getNoteNumber()))
+                    return;
             }
 
-            // If we found enough newlines, remove all text up to that position
-            if (currentPos < text.length())
+            // Send the note message
+            if (midiOutput != nullptr)
             {
-                midiMessagesBox.setHighlightedRegion({ 0, currentPos });
-                midiMessagesBox.insertTextAtCaret("");
-
-                // Update line count
-                currentLogLines -= linesToRemove;
+                midiOutput->sendMessageNow(message);
             }
-            else
+        }
+        else // Must be sostenuto pedal message
+        {
+            const bool pedalDown = message.isSostenutoPedalOn();
+            const bool wasDown = sostenutoPedalButton.getToggleState();
+
+            // Handle pedal state change
+            if (pedalDown && !wasDown) // Pedal pressed
             {
-                // Fallback: clear everything if things got out of sync
-                midiMessagesBox.clear();
-                currentLogLines = 1; // Just the line we're about to add
-                midiMessagesBox.insertTextAtCaret(m + juce::newLine);
+                // Capture all currently held notes
+                for (int note = 0; note < 128; ++note)
+                {
+                    if (keyboardState.isNoteOn(1, note))
+                    {
+                        setSostenutoPedalHeldNote(note);
+                    }
+                }
+            }
+            else if (!pedalDown && wasDown) // Pedal released
+            {
+                handlePedalRelease(message.getTimeStamp());
+            }
+
+            // Update pedal button state
+            sostenutoPedalButton.handleCC66(message.getControllerValue());
+        }
+    }
+
+    // Process batched MIDI messages
+    void processBatchedMessages()
+    {
+        const juce::ScopedLock sl(midiProcessLock);
+
+        juce::MidiBuffer::Iterator it(midiMessageBuffer);
+        juce::MidiMessage message;
+        int samplePosition;
+
+        while (it.getNextEvent(message, samplePosition))
+        {
+            // Process non-time-critical messages
+            if (!message.isNoteOnOrOff() &&
+                !message.isSostenutoPedalOn() &&
+                !message.isSostenutoPedalOff())
+            {
+                if (midiOutput)
+                    midiOutput->sendMessageNow(message);
             }
         }
 
-        // Always ensure caret is at the end for auto-scrolling
-        midiMessagesBox.moveCaretToEnd();
+        midiMessageBuffer.clear();
     }
 
-    /** Starts listening to a MIDI input device, enabling it if necessary. */
+    // Format a log entry - branchless optimization for string formatting
+    juce::String formatLogEntry(const LogEntry& entry) const
+    {
+        auto time = entry.timestamp - startTime;
+
+        // Use integer division and modulo for time components
+        const int hours = static_cast<int>(time / 3600.0) % 24;
+        const int minutes = static_cast<int>(time / 60.0) % 60;
+        const int seconds = static_cast<int>(time) % 60;
+        const int millis = static_cast<int>(time * 1000.0) % 1000;
+
+        // Pre-allocate the string to avoid reallocations
+        juce::String result;
+        result.preallocateBytes(100); // Average log line length
+
+        // Format time with fixed width fields
+        result
+            << juce::String::formatted("%02d:%02d:%02d.%03d", hours, minutes, seconds, millis)
+            << "  -  "
+            << getMidiMessageDescription(entry.message)
+            << " (" << entry.source << ")\n";
+
+        return result;
+    }
+
+    // Trim log to keep it within size limits - simplified for better performance
+    void trimLogIfNeeded()
+    {
+        // Only trim if we're over the limit
+        const int excess = currentLogLines - MAX_LOG_LINES;
+        if (excess <= 0)
+            return;
+
+        // Optimization: If we're way over the limit, just clear and start fresh
+        if (excess > MAX_LOG_LINES / 2)
+        {
+            midiMessagesBox.clear();
+            currentLogLines = 0;
+            return;
+        }
+
+        // Otherwise do a targeted trim of exactly the lines we need to remove
+        juce::String text = midiMessagesBox.getText();
+
+        // Find the position after the last line we need to remove
+        int pos = 0;
+        for (int i = 0; i < excess && pos < text.length(); ++i)
+        {
+            int nextPos = text.indexOfChar(pos, '\n');
+            if (nextPos == -1)
+                break;
+            pos = nextPos + 1; // Move past the newline
+        }
+
+        // Only modify the text if we found a valid position
+        if (pos > 0 && pos < text.length())
+        {
+            // Replace text in one operation
+            midiMessagesBox.setHighlightedRegion({ 0, pos });
+            midiMessagesBox.insertTextAtCaret("");
+            currentLogLines -= excess;
+        }
+    }
+
+    // Set up MIDI input device
     void setMidiInput(int index)
     {
         auto list = juce::MidiInput::getAvailableDevices();
 
-        deviceManager.removeMidiInputDeviceCallback(list[lastInputIndex].identifier, this);
+        if (lastInputIndex >= 0 && lastInputIndex < list.size())
+            deviceManager.removeMidiInputDeviceCallback(list[lastInputIndex].identifier, this);
 
         auto newInput = list[index];
 
@@ -299,6 +634,7 @@ private:
         lastInputIndex = index;
     }
 
+    // Set up MIDI output device
     void setMidiOutput(int index)
     {
         auto list = juce::MidiOutput::getAvailableDevices();
@@ -316,283 +652,286 @@ private:
         }
     }
 
+    // Handle async updates - simplified to reduce branching
+    void handleAsyncUpdate() override
+    {
+        // Process any batched messages first (direct access, no thread synchronization needed)
+        const juce::ScopedLock sl(midiProcessLock);
+
+        if (!midiMessageBuffer.isEmpty() && midiOutput != nullptr)
+        {
+            // Simple iteration without conditional branches inside the loop
+            juce::MidiBuffer::Iterator it(midiMessageBuffer);
+            juce::MidiMessage message;
+            int samplePosition;
+
+            while (it.getNextEvent(message, samplePosition))
+            {
+                // Only send if this is not a time-critical message
+                // (time critical messages are sent directly in processMidiRealTime)
+                const bool isTimeCritical = message.isNoteOnOrOff() ||
+                    message.isSostenutoPedalOn() ||
+                    message.isSostenutoPedalOff();
+
+                if (!isTimeCritical)
+                    midiOutput->sendMessageNow(message);
+            }
+
+            // Clear buffer once done
+            midiMessageBuffer.clear();
+        }
+    }
+
+    // Handle sostenuto pedal button click
     void handleSostenutoPedalButton()
     {
         bool isDown = sostenutoPedalButton.getToggleState();
         juce::MidiMessage message = juce::MidiMessage::controllerEvent(1, 66, isDown ? 127 : 0);
         message.setTimeStamp(juce::Time::getMillisecondCounterHiRes() * 0.001);
 
-        // Since we know isDown is changing, we can immediately handle the pedal state here
         if (isDown) // Pedal just pressed
         {
             // Capture currently held notes
             for (int note = 0; note < 128; ++note)
             {
                 if (keyboardState.isNoteOn(1, note))
-                {
                     setSostenutoPedalHeldNote(note);
-                }
             }
         }
         else // Pedal just released
         {
-            // Handle pedal release (your existing code for this)
-            handlePedalRelease();
+            handlePedalRelease(message.getTimeStamp());
         }
 
-        // Log and send the CC message
-        postMessageToList(message, "Pedal Button");
+        // Send CC message
         if (midiOutput)
-        {
             midiOutput->sendMessageNow(message);
+
+        // Log the action
+        if (loggingEnabled)
+        {
+            const juce::ScopedLock sl(logMutex);
+            int start1, size1, start2, size2;
+            logFifo.prepareToWrite(1, start1, size1, start2, size2);
+
+            if (size1 + size2 > 0)
+            {
+                const int writeIndex = size1 == 1 ? start1 : start2;
+                logEntries[writeIndex] = { message, "Pedal Button", message.getTimeStamp() };
+                logFifo.finishedWrite(1);
+            }
         }
     }
 
-    void handleMidiOutput(const juce::MidiMessage& message)
-    {
-        if (midiOutput != nullptr)
-        {
-            midiOutput->sendMessageNow(message);
-            postMessageToList(message, midiOutput->getName());
-        }
-    }
-
-    // These methods handle callbacks from the midi device + on-screen keyboard..
+    // MidiInputCallback implementation - direct processing with minimal branching
     void handleIncomingMidiMessage(juce::MidiInput* source, const juce::MidiMessage& message) override
     {
-        const juce::ScopedValueSetter<bool> scopedInputFlag(isAddingFromMidiInput, true);
+        // Process message directly - no FIFO needed for such a simple operation
+        isAddingFromMidiInput = true;
 
-        // Always log incoming message first
-        postMessageToList(message, source->getName() + " (Input)");
-
-        // Process the message as before
-        if (message.isNoteOnOrOff())
+        // High-priority path: For time-critical messages, process immediately
+        if (message.isNoteOnOrOff() || message.isSostenutoPedalOn() || message.isSostenutoPedalOff())
         {
-            keyboardState.processNextMidiEvent(message);
-
-            // Only process note-offs if not held by sostenuto
-            if (message.isNoteOff() && isSostenutoPedalHeldNote(message.getNoteNumber()))
-                return;
-
-            if (midiOutput)
-            {
-                midiOutput->sendMessageNow(message);
-                postMessageToList(message, midiOutput->getName());
-            }
-            return;
-        }
-        else if (message.isNoteOff())
-        {
-            int noteNumber = message.getNoteNumber();
-
-            // Check if this note is being held by sostenuto
-            if (isSostenutoPedalHeldNote(noteNumber))
-            {
-                // Don't forward note-off if the note is being held by sostenuto
-                keyboardState.processNextMidiEvent(message); // Update visual state
-            }
-            else
-            {
-                // Process normally if note isn't held by sostenuto
-                keyboardState.processNextMidiEvent(message);
-                if (midiOutput)
-                {
-                    midiOutput->sendMessageNow(message);
-                    postMessageToList(message, midiOutput->getName());
-                }
-            }
-        }
-        else if (message.isController() && message.getControllerNumber() == 66)
-        {
-            // Handle sostenuto pedal change
-            bool pedalDown = message.getControllerValue() >= 64; // Message will change pedal to down
-            bool wasDown = sostenutoPedalButton.getToggleState(); // Pedal state marked down
-            if (pedalDown && !wasDown)
-            {
-                // Pedal just pressed - capture currently held notes
-                for (int note = 0; note < 128; ++note)
-                {
-                    if (keyboardState.isNoteOn(1, note))  // Check all notes on channel 1
-                    {
-                        setSostenutoPedalHeldNote(note);
-                    }
-                }
-            }
-            else if (!pedalDown && wasDown)
-            {
-				handlePedalRelease(); // Pedal just released
-            }
-
-            sostenutoPedalButton.handleCC66(message.getControllerValue());
-
+            processMidiRealTime(message);
         }
         else
         {
-            // Process all other MIDI messages normally
-            keyboardState.processNextMidiEvent(message);
-            if (midiOutput)
+            // Low-priority path: For other messages, add to buffer for batch processing
+            const juce::ScopedLock sl(midiProcessLock);
+            midiMessageBuffer.addEvent(message, 0);
+            triggerAsyncUpdate();
+        }
+
+        // Add to logging system if enabled (non-blocking)
+        if (loggingEnabled.load(std::memory_order_relaxed))
+        {
+            // Try to add to log FIFO - if full, simply drop the message
+            int start1, size1, start2, size2;
+            logFifo.prepareToWrite(1, start1, size1, start2, size2);
+
+            if (size1 + size2 > 0)
             {
-                midiOutput->sendMessageNow(message);
-                postMessageToList(message, midiOutput->getName());
+                const int writeIndex = size1 == 1 ? start1 : start2;
+                logEntries[writeIndex] = { message, source->getName() + " (Input)", message.getTimeStamp() };
+                logFifo.finishedWrite(1);
             }
         }
 
+        isAddingFromMidiInput = false;
     }
 
+    // MidiKeyboardStateListener implementation for note on
     void handleNoteOn(juce::MidiKeyboardState*, int midiChannel, int midiNoteNumber, float velocity) override
     {
         if (!isAddingFromMidiInput)
         {
             auto m = juce::MidiMessage::noteOn(midiChannel, midiNoteNumber, velocity);
             m.setTimeStamp(juce::Time::getMillisecondCounterHiRes() * 0.001);
-            postMessageToList(m, "On-Screen Keyboard");
+
+            // Send MIDI message
             if (midiOutput)
-            {
                 midiOutput->sendMessageNow(m);
-                // Log the forwarded message to MIDI device
-                postMessageToList(m, midiOutput->getName());
+
+            // Add to log if enabled
+            if (loggingEnabled)
+            {
+                const juce::ScopedLock sl(logMutex);
+                int start1, size1, start2, size2;
+                logFifo.prepareToWrite(1, start1, size1, start2, size2);
+
+                if (size1 + size2 > 0)
+                {
+                    const int writeIndex = size1 == 1 ? start1 : start2;
+                    logEntries[writeIndex] = { m, "On-Screen Keyboard", m.getTimeStamp() };
+                    logFifo.finishedWrite(1);
+                }
             }
         }
     }
+
+    // MidiKeyboardStateListener implementation for note off
     void handleNoteOff(juce::MidiKeyboardState*, int midiChannel, int midiNoteNumber, float /*velocity*/) override
     {
         if (!isAddingFromMidiInput)
         {
-            // Only block note-off if specifically held by sostenuto
-			if (isSostenutoPedalHeldNote(midiNoteNumber))
-            {
-                auto m = juce::MidiMessage::noteOff(midiChannel, midiNoteNumber);
-                m.setTimeStamp(juce::Time::getMillisecondCounterHiRes() * 0.001);
-                postMessageToList(m, "On-Screen Keyboard (Held by Sostenuto)");
-                // Don't send MIDI - note is held by sostenuto
-            }
-            else
-            {
-                auto m = juce::MidiMessage::noteOff(midiChannel, midiNoteNumber);
-                m.setTimeStamp(juce::Time::getMillisecondCounterHiRes() * 0.001);
-                postMessageToList(m, "On-Screen Keyboard");
+            auto m = juce::MidiMessage::noteOff(midiChannel, midiNoteNumber);
+            m.setTimeStamp(juce::Time::getMillisecondCounterHiRes() * 0.001);
 
-                if (midiOutput)
+            // Skip if held by sostenuto
+            if (isSostenutoPedalHeldNote(midiNoteNumber))
+            {
+                if (loggingEnabled)
                 {
-                    midiOutput->sendMessageNow(m);
-                    postMessageToList(m, midiOutput->getName());
+                    const juce::ScopedLock sl(logMutex);
+                    int start1, size1, start2, size2;
+                    logFifo.prepareToWrite(1, start1, size1, start2, size2);
+
+                    if (size1 + size2 > 0)
+                    {
+                        const int writeIndex = size1 == 1 ? start1 : start2;
+                        logEntries[writeIndex] = { m, "On-Screen Keyboard (Held by Sostenuto)", m.getTimeStamp() };
+                        logFifo.finishedWrite(1);
+                    }
+                }
+                return;
+            }
+
+            // Send note-off
+            if (midiOutput)
+                midiOutput->sendMessageNow(m);
+
+            // Add to log if enabled
+            if (loggingEnabled)
+            {
+                const juce::ScopedLock sl(logMutex);
+                int start1, size1, start2, size2;
+                logFifo.prepareToWrite(1, start1, size1, start2, size2);
+
+                if (size1 + size2 > 0)
+                {
+                    const int writeIndex = size1 == 1 ? start1 : start2;
+                    logEntries[writeIndex] = { m, "On-Screen Keyboard", m.getTimeStamp() };
+                    logFifo.finishedWrite(1);
                 }
             }
         }
     }
 
-    // This is used to dispach an incoming message to the message thread
-    class IncomingMessageCallback : public juce::CallbackMessage
+    // Sostenuto pedal note handling
+    // Branchless sostenuto note setting
+    constexpr inline void setSostenutoPedalHeldNote(int note)
     {
-    public:
-        IncomingMessageCallback(MainContentComponent* o, const juce::MidiMessage& m, const juce::String& s)
-            : owner(o), message(m), source(s)
-        {
-        }
+        // Only perform operation if note is in valid range, without branching
+        const bool isValidNote = (note >= 0 && note < 128);
+        const size_t index = note / 64;
+        const size_t bit = note % 64;
 
-        void messageCallback() override
-        {
-            if (owner != nullptr)
-                owner->addMessageToList(message, source);
-        }
+        // This will have no effect if isValidNote is false (out of range)
+        sostenutoPedalHeldNotesBitmap[index] |= isValidNote * (1ULL << bit);
+    }
 
-        Component::SafePointer<MainContentComponent> owner;
-        juce::MidiMessage message;
-        juce::String source;
-    };
-
-    void postMessageToList(const juce::MidiMessage& message, const juce::String& source)
+    // Branchless sostenuto note clearing
+    constexpr inline void clearSostenutoPedalHeldNote(int note)
     {
-        if (loggingEnabled)
-            (new IncomingMessageCallback(this, message, source))->post();
+        // Only perform operation if note is in valid range, without branching
+        const bool isValidNote = (note >= 0 && note < 128);
+        const size_t index = note / 64;
+        const size_t bit = note % 64;
+
+        // This will have no effect if isValidNote is false (out of range)
+        sostenutoPedalHeldNotesBitmap[index] &= ~(isValidNote * (1ULL << bit));
     }
 
-    void addMessageToList(const juce::MidiMessage& message, const juce::String& source)
+    // Branchless implementation of sostenuto note check
+    constexpr inline bool isSostenutoPedalHeldNote(int note) const
     {
-        auto time = message.getTimeStamp() - startTime;
-
-        auto hours = ((int)(time / 3600.0)) % 24;
-        auto minutes = ((int)(time / 60.0)) % 60;
-        auto seconds = ((int)time) % 60;
-        auto millis = ((int)(time * 1000.0)) % 1000;
-
-        auto timecode = juce::String::formatted("%02d:%02d:%02d.%03d",
-            hours,
-            minutes,
-            seconds,
-            millis);
-
-        auto description = getMidiMessageDescription(message);
-
-        juce::String midiMessageString(timecode + "  -  " + description + " (" + source + ")"); // [7]
-        logMessage(midiMessageString);
+        // Use arithmetic to avoid branching
+        // This evaluates to 0 if note is out of range, allowing the rest of the expression to be safe
+        return (note >= 0 && note < 128) &&
+            ((sostenutoPedalHeldNotesBitmap[note / 64] & (1ULL << (note % 64))) != 0);
     }
 
-    // Let's assume we have a bitmap representation for the sostenuto pedal held notes
-    // Using 128-bit bitmap (2 uint64_t) for 128 MIDI notes (0-127)
-    uint64_t sostenutoPedalHeldNotesBitmap[2] = { 0, 0 }; // Initialized to all zeros
-
-    // Function to set a note in the bitmap
-    constexpr inline void setSostenutoPedalHeldNote(int note) {
-        if (note >= 0 && note < 128) {
-            size_t index = note / 64;
-            size_t bit = note % 64;
-            sostenutoPedalHeldNotesBitmap[index] |= (1ULL << bit);
-        }
-    }
-
-    // Function to clear a note from the bitmap
-    constexpr inline void clearSostenutoPedalHeldNote(int note) {
-        if (note >= 0 && note < 128) {
-            size_t index = note / 64;
-            size_t bit = note % 64;
-            sostenutoPedalHeldNotesBitmap[index] &= ~(1ULL << bit);
-        }
-    }
-
-    // Function to check if a note is in the bitmap
-    constexpr inline bool isSostenutoPedalHeldNote(int note) {
-        if (note >= 0 && note < 128) {
-            size_t index = note / 64;
-            size_t bit = note % 64;
-            return (sostenutoPedalHeldNotesBitmap[index] & (1ULL << bit)) != 0;
-        }
-        return false;
-    }
-
-    // Function to reset (clear) all notes from the bitmap
-    constexpr inline void resetSostenutoPedalHeldNotes() {
+    void resetSostenutoPedalHeldNotes() {
         sostenutoPedalHeldNotesBitmap[0] = 0;
         sostenutoPedalHeldNotesBitmap[1] = 0;
     }
 
-	// Function to handle pedal release
-    void handlePedalRelease()
+    // Handle pedal release - optimized for MSVC 
+    void handlePedalRelease(double timeStamp)
     {
-        // Pedal released - send note-offs for any held notes that aren't still pressed
-        for (size_t k = 0; k < bitmapSize; ++k)
+        // Cache this to avoid repeated atomic loads
+        const bool shouldLog = loggingEnabled.load(std::memory_order_relaxed);
+
+        // Process both bitmap segments
+        for (size_t k = 0; k < 2; ++k)
         {
             uint64_t bitset = sostenutoPedalHeldNotesBitmap[k];
+
+            // Process all set bits
             while (bitset != 0)
             {
+                // Find and clear lowest set bit
+                // MSVC-friendly bit manipulation
+#if defined(_MSC_VER)
+                unsigned long bitIndex;
+                _BitScanForward64(&bitIndex, bitset);
+                uint64_t mask = 1ULL << bitIndex;
+                bitset &= ~mask;  // Clear the bit
+                int note = k * 64 + static_cast<int>(bitIndex);
+#else
                 uint64_t t = bitset & -bitset;
                 int r = countTrailingZeros(bitset);
+                bitset ^= t;  // Clear the bit
                 int note = k * 64 + r;
+#endif
 
-                if (!keyboardState.isNoteOn(1, note))
-                {  // If note isn't physically held anymore
+                // Only send note-off if the note isn't physically pressed
+                if (!keyboardState.isNoteOn(1, note) && midiOutput != nullptr)
+                {
                     auto noteOff = juce::MidiMessage::noteOff(1, note);
-                    if (midiOutput)
+                    noteOff.setTimeStamp(timeStamp);
+                    midiOutput->sendMessageNow(noteOff);
+
+                    // Log if enabled (separate, non-blocking path)
+                    if (shouldLog)
                     {
-                        midiOutput->sendMessageNow(noteOff);
-                        postMessageToList(noteOff, "Sostenuto Release");
+                        int start1, size1, start2, size2;
+                        logFifo.prepareToWrite(1, start1, size1, start2, size2);
+
+                        if (size1 + size2 > 0)
+                        {
+                            const int writeIndex = size1 == 1 ? start1 : start2;
+                            logEntries[writeIndex] = { noteOff, "Sostenuto Release", noteOff.getTimeStamp() };
+                            logFifo.finishedWrite(1);
+                        }
                     }
                 }
-
-                bitset ^= t;
             }
         }
-        resetSostenutoPedalHeldNotes();
+
+        // Reset bitmap after processing all notes
+        sostenutoPedalHeldNotesBitmap[0] = 0;
+        sostenutoPedalHeldNotesBitmap[1] = 0;
     }
 
     // Platform-independent trailing zero count
@@ -619,26 +958,48 @@ private:
     }
 
     //==============================================================================
+    // Constants and member variables
     static constexpr size_t bitmapSize = 2; // 2 uint64_t for 128 MIDI notes
-    double           startTime;
-    bool                 loggingEnabled = false; // Start with logging disabled
-    int                  currentLogLines = 0;  // Add this member variable to track line count
-    static constexpr int MAX_LOG_LINES = 99;  // Maximum number of lines to keep in the log
-    int  lastInputIndex = 0;
-    bool isAddingFromMidiInput = false;
-    juce::AudioDeviceManager deviceManager;       
+    static constexpr int MAX_LOG_LINES = 500; // Maximum number of lines to keep in the log
+    static constexpr int LOG_TIMER_FREQUENCY = 30; // Hz
+    static constexpr size_t LOG_CHUNK_SIZE = 16; // Process logs in chunks of this size
+
+    double startTime = 0;
+    std::atomic<bool> loggingEnabled{ false }; // Start with logging disabled
+    std::atomic<bool> isAddingFromMidiInput{ false };
+    int currentLogLines = 0;
+    int lastInputIndex = 0;
+
+    // Audio and MIDI handling
+    juce::AudioDeviceManager deviceManager;
     std::unique_ptr<juce::MidiOutput> midiOutput = nullptr;
+    juce::MidiKeyboardState keyboardState;
+    juce::MidiBuffer midiMessageBuffer;
+
+    // Thread-safe data structures
+    std::unique_ptr<juce::ThreadPool> midiThreadPool;
+    juce::AbstractFifo midiFifo{ 256 }; // Smaller size for better performance
+    std::array<juce::MidiMessage, 256> midiMessageArray;
+    juce::CriticalSection midiProcessLock;
+
+    // Logging components
+    juce::AbstractFifo logFifo{ 512 }; // Smaller buffer for better performance
+    std::vector<LogEntry> logEntries{ 512 };
+    std::unique_ptr<LogTimer> logTimer;
+    juce::CriticalSection logMutex;
+
+    // UI Components
+    juce::ComboBox midiInputList;
+    juce::Label midiInputListLabel;
     juce::ComboBox midiOutputList;
-    juce::Label    midiOutputListLabel;
-    juce::ComboBox midiInputList;                    
-    juce::Label    midiInputListLabel;       
-    juce::MidiKeyboardState     keyboardState;  
-    juce::MidiKeyboardComponent keyboardComponent;  
+    juce::Label midiOutputListLabel;
+    juce::MidiKeyboardComponent keyboardComponent;
     juce::TextEditor midiMessagesBox;
-    PedalButton   sostenutoPedalButton;
-    juce::ToggleButton   loggingEnabledButton;
-    juce::String  onScreenKeyboardSource = juce::String("On-Screen Keyboard");
-    juce::String  sostenutoPedalSource   = juce::String("Sostenuto Release" );
-    //==============================================================================
+    PedalButton sostenutoPedalButton;
+    juce::ToggleButton loggingEnabledButton;
+
+    // Sostenuto pedal state
+    uint64_t sostenutoPedalHeldNotesBitmap[2] = { 0, 0 };
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainContentComponent)
 };

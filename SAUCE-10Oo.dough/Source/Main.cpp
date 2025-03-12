@@ -1,68 +1,61 @@
-/*
-  ==============================================================================
-
-    This file contains the startup code for a PIP.
-
-  ==============================================================================
-*/
-
 #include <JuceHeader.h>
 #include "SAUCE10oOdough.h"
 
-class Application    : public juce::JUCEApplication
+//==============================================================================
+class MainWindow : public juce::DocumentWindow
 {
 public:
-    //==============================================================================
-    Application() = default;
-
-    const juce::String getApplicationName() override       { return "SAUCE10oOdough"; }
-    const juce::String getApplicationVersion() override    { return "1.0.0"; }
-
-    void initialise (const juce::String&) override
+    MainWindow(const juce::String& name)
+        : DocumentWindow(name,
+            juce::Desktop::getInstance().getDefaultLookAndFeel()
+            .findColour(ResizableWindow::backgroundColourId),
+            DocumentWindow::allButtons)
     {
-        mainWindow.reset (new MainWindow ("SAUCE10oOdough", new MainContentComponent, *this));
+        setUsingNativeTitleBar(true);
+        setContentOwned(new MainContentComponent(), true);
+
+        setResizable(true, true);
+        centreWithSize(getWidth(), getHeight());
+        setVisible(true);
     }
 
-    void shutdown() override                         { mainWindow = nullptr; }
+    void closeButtonPressed() override
+    {
+        juce::JUCEApplication::getInstance()->systemRequestedQuit();
+    }
 
 private:
-    class MainWindow    : public juce::DocumentWindow
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(MainWindow)
+};
+
+//==============================================================================
+class GuiAppApplication : public juce::JUCEApplication
+{
+public:
+    GuiAppApplication() {}
+
+    const juce::String getApplicationName() override { return ProjectInfo::projectName; }
+    const juce::String getApplicationVersion() override { return ProjectInfo::versionString; }
+    bool moreThanOneInstanceAllowed() override { return true; }
+
+    void initialise(const juce::String& commandLine) override
     {
-    public:
-        MainWindow (const juce::String& name, juce::Component* c, JUCEApplication& a)
-            : DocumentWindow (name, juce::Desktop::getInstance().getDefaultLookAndFeel()
-                                                                .findColour (ResizableWindow::backgroundColourId),
-                              juce::DocumentWindow::allButtons),
-              app (a)
-        {
-            setUsingNativeTitleBar (true);
-            setContentOwned (c, true);
+        mainWindow.reset(new MainWindow(getApplicationName()));
+    }
 
-           #if JUCE_ANDROID || JUCE_IOS
-            setFullScreen (true);
-           #else
-            setResizable (true, false);
-            setResizeLimits (300, 250, 10000, 10000);
-            centreWithSize (getWidth(), getHeight());
-           #endif
+    void shutdown() override
+    {
+        mainWindow = nullptr;
+    }
 
-            setVisible (true);
-        }
+    void systemRequestedQuit() override
+    {
+        quit();
+    }
 
-        void closeButtonPressed() override
-        {
-            app.systemRequestedQuit();
-        }
-
-    private:
-        JUCEApplication& app;
-
-        //==============================================================================
-        JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainWindow)
-    };
-
+private:
     std::unique_ptr<MainWindow> mainWindow;
 };
 
 //==============================================================================
-START_JUCE_APPLICATION (Application)
+START_JUCE_APPLICATION(GuiAppApplication)

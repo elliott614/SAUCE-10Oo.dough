@@ -4,6 +4,7 @@ public:
     PedalButton(const juce::String& buttonName)
         : juce::Button(buttonName)
     {
+        setMouseClickGrabsKeyboardFocus(false);
         // Change to non-latching behavior
         setClickingTogglesState(false);
     }
